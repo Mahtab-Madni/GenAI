@@ -1,10 +1,10 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 /* eslint-disable react-hooks/refs */
+import axios from "axios";
 import { useEffect, useRef, useState } from "react";
 import Chat from "./chat";
 
 const SESSION_STORAGE_KEY = "ragchat_session_id";
-const CHAT_HISTORY_KEY = "ragchat_history";
 
 export default function Home() {
   const [query, setQuery] = useState("");
@@ -16,22 +16,26 @@ export default function Home() {
 
   // Shared history tracking state
   const [history, setHistory] = useState([]);
-  // eslint-disable-next-line no-unused-vars
-  const [activeSessionId, setActiveSessionId] = useState(null);
 
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // Load chat history on mount
+  // Load chat session summaries from MongoDB on mount
   useEffect(() => {
-    const savedHistory = window.localStorage.getItem(CHAT_HISTORY_KEY);
-    if (savedHistory) {
-      setHistory(JSON.parse(savedHistory));
-    }
-    const existingSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
-    if (existingSessionId) {
-      setActiveSessionId(existingSessionId);
-    }
+    const loadSessionHistory = async () => {
+      try {
+        const { data } = await axios.get(
+          "http://localhost:3000/api/chat/sessions",
+        );
+        if (Array.isArray(data)) {
+          setHistory(data);
+        }
+      } catch (error) {
+        console.error("Failed to load chat sessions:", error);
+      }
+    };
+
+    void loadSessionHistory();
   }, [send]); // Reload history whenever switching views back and forth
 
   // Force multiline layout rules if a file is uploaded or text expands
@@ -52,18 +56,36 @@ export default function Home() {
 
     const finalPrompt = query.trim();
     setInitialPrompt(finalPrompt);
-
-    // Clear out any old explicitly set session so Chat creates a fresh one
-    window.localStorage.removeItem(SESSION_STORAGE_KEY);
-    setActiveSessionId(null);
     setSend(true);
     setQuery("");
+  };
+
+  const handleDeleteChat = async (id, e) => {
+    e.stopPropagation(); // Prevents selection click event from triggering
+
+    if (!window.confirm("Are you sure you want to delete this conversation?"))
+      return;
+
+    try {
+      await axios.delete("http://localhost:3000/api/chat/history", {
+        params: { sessionId: id },
+      });
+
+      // Refresh sidebar sessions history list
+      setHistory((prevHistory) => prevHistory.filter((chat) => chat.id !== id));
+
+      // // If the currently open chat is the one being deleted, reset window state to a new chat
+      // if (id === sessionId) {
+      //   startNewChat();
+      // }
+    } catch (error) {
+      console.error("Failed to delete chat session from MongoDB:", error);
+    }
   };
 
   // Switch directly to a historic chat session
   const handleSelectChat = (id) => {
     window.localStorage.setItem(SESSION_STORAGE_KEY, id);
-    setActiveSessionId(id);
     setInitialPrompt(""); // No new initial prompt, just viewing old logs
     setSelectedFile(null);
     setAttachedFileName("");
@@ -73,7 +95,6 @@ export default function Home() {
   // Reset view back to the clean home landing screen for a new prompt
   const handleNewChatClick = () => {
     window.localStorage.removeItem(SESSION_STORAGE_KEY);
-    setActiveSessionId(null);
     setInitialPrompt("");
     setSelectedFile(null);
     setAttachedFileName("");
@@ -114,6 +135,7 @@ export default function Home() {
           setSelectedFile(null);
           setInitialPrompt("");
         }}
+        onNewChat={handleNewChatClick}
       />
     );
   }
@@ -121,15 +143,15 @@ export default function Home() {
   return (
     <div className="flex h-screen w-full bg-white text-slate-950 overflow-hidden">
       {/* LEFT SIDEBAR AREA */}
-      <aside className="w-64 border-r border-slate-200 bg-slate-50 flex flex-col shrink-0 h-full hidden md:flex">
-        <div className="p-4 border-b border-slate-200">
+      <aside className="w-64 border-r border-slate-200 bg-slate-50 flex flex-col shrink-0 h-full md:flex">
+        {/* <div className="p-4 border-b border-slate-200">
           <button
             onClick={handleNewChatClick}
             className="w-full py-2 px-4 rounded-xl bg-slate-900 text-white text-sm font-medium transition hover:bg-slate-800 shadow-sm"
           >
             + New Chat
           </button>
-        </div>
+        </div> */}
 
         {/* Scrollable Chat History List */}
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
@@ -142,13 +164,33 @@ export default function Home() {
             </div>
           ) : (
             history.map((chat) => (
-              <button
-                key={chat.id}
-                onClick={() => handleSelectChat(chat.id)}
-                className="w-full text-left px-3 py-2.5 rounded-xl text-sm transition font-medium truncate block text-slate-600 hover:bg-slate-100 hover:text-slate-900"
-              >
-                {chat.title}
-              </button>
+              <div>
+                <button
+                  key={chat.id}
+                  onClick={() => handleSelectChat(chat.id)}
+                  className="w-full text-left px-3 py-2.5 rounded-xl text-sm transition font-medium truncate block text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+                >
+                  {chat.title}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => handleDeleteChat(chat.id, e)}
+                  className="absolute right-2 opacity-0 group-hover:opacity-100 p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-slate-200/60 transition-all duration-150"
+                  title="Delete Conversation"
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    className="h-4 w-4"
+                  >
+                    <path d="M3 6h18" />
+                    <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+                    <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                  </svg>
+                </button>
+              </div>
             ))
           )}
         </div>

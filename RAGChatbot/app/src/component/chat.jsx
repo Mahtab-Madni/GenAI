@@ -1,22 +1,32 @@
+/* eslint-disable no-unused-vars */
 /* eslint-disable react-hooks/immutability */
 /* eslint-disable react-hooks/set-state-in-effect */
 import axios from "axios";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import { useEffect, useRef, useState } from "react";
+import "katex/dist/katex.min.css";
 
 const SESSION_STORAGE_KEY = "ragchat_session_id";
-const CHAT_HISTORY_KEY = "ragchat_history";
 
 function createSessionId() {
   return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-export default function Chat({ initialPrompt = "", file = null, onBack }) {
+export default function Chat({
+  initialPrompt = "",
+  file = null,
+  onBack,
+  onNewChat,
+}) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [sessionId, setSessionId] = useState(null);
 
-  // Chat history tracking state
+  // Session summaries list for the sidebar
   const [history, setHistory] = useState([]);
 
   const hasSentInitialRef = useRef(false);
@@ -26,85 +36,122 @@ export default function Chat({ initialPrompt = "", file = null, onBack }) {
   const [attachedFileName, setAttachedFileName] = useState("");
   const fileInputRef = useRef(null);
 
+  const syncHistoryFromServer = async (currentSessionId) => {
+    if (!currentSessionId) return;
+
+    try {
+      const { data } = await axios.get(
+        "http://localhost:3000/api/chat/history",
+        {
+          params: { sessionId: currentSessionId },
+        },
+      );
+
+      if (Array.isArray(data)) {
+        const loadedMessages = data
+          .filter((msg) => msg?.role)
+          .map((msg) => ({
+            id:
+              msg._id?.$oid ||
+              msg._id ||
+              `${currentSessionId}-${msg.createdAt}`,
+            role: msg.role,
+            content: msg.content || "",
+            fileName: msg.fileName || null,
+          }));
+
+        setMessages(loadedMessages);
+      }
+    } catch (error) {
+      console.error("Failed to load chat history from MongoDB:", error);
+    }
+  };
+
+  const fetchSessionSummaries = async () => {
+    try {
+      const { data } = await axios.get(
+        "http://localhost:3000/api/chat/sessions",
+      );
+
+      if (Array.isArray(data)) {
+        setHistory(data);
+      }
+    } catch (error) {
+      console.error("Failed to load chat sessions from MongoDB:", error);
+    }
+  };
+
+  const startNewChat = () => {
+    const sessionKey = createSessionId();
+    setSessionId(sessionKey);
+    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionKey);
+    setMessages([]);
+    setInput("");
+    setAttachedFileName("");
+    setSelectedFile(null);
+    hasSentInitialRef.current = false;
+    void fetchSessionSummaries();
+  };
+
+  const updateHistoryWithMessages = async (nextMessages) => {
+    if (!sessionId) return;
+
+    try {
+      await axios.post("http://localhost:3000/api/chat/history", {
+        sessionId,
+        messages: nextMessages,
+      });
+      setMessages(nextMessages);
+    } catch (error) {
+      console.error("Failed to save chat history:", error);
+      setMessages(nextMessages);
+    }
+  };
+
+  // Delete handler for individual chat history sessions
+  const handleDeleteChat = async (id, e) => {
+    e.stopPropagation(); // Prevents selection click event from triggering
+
+    if (!window.confirm("Are you sure you want to delete this conversation?"))
+      return;
+
+    try {
+      await axios.delete("http://localhost:3000/api/chat/history", {
+        params: { sessionId: id },
+      });
+
+      // Refresh sidebar sessions history list
+      await fetchSessionSummaries();
+
+      // If the currently open chat is the one being deleted, reset window state to a new chat
+      if (id === sessionId) {
+        startNewChat();
+      }
+    } catch (error) {
+      console.error("Failed to delete chat session from MongoDB:", error);
+    }
+  };
+
   // 1. Initialize History and Session on Mount
   useEffect(() => {
-    const savedHistory = window.localStorage.getItem(CHAT_HISTORY_KEY);
-    const parsedHistory = savedHistory ? JSON.parse(savedHistory) : [];
-    setHistory(parsedHistory);
-
     const existingSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
     if (existingSessionId) {
       setSessionId(existingSessionId);
-      // Load existing messages if any
-      const currentChat = parsedHistory.find((h) => h.id === existingSessionId);
-      if (currentChat) setMessages(currentChat.messages || []);
+      void syncHistoryFromServer(existingSessionId);
     } else {
-      startNewChat(parsedHistory);
+      void startNewChat();
     }
+
+    void fetchSessionSummaries();
   }, []);
 
-  // 2. Helper to start a completely fresh conversation thread
-  const startNewChat = (currentHistory = history) => {
-    const newSessionId = createSessionId();
-    window.localStorage.setItem(SESSION_STORAGE_KEY, newSessionId);
-    setSessionId(newSessionId);
-    setMessages([]);
-    hasSentInitialRef.current = false;
-
-    const newHistoryItem = {
-      id: newSessionId,
-      title: "New Chat",
-      messages: [],
-      timestamp: Date.now(),
-    };
-
-    const updatedHistory = [newHistoryItem, ...currentHistory];
-    setHistory(updatedHistory);
-    window.localStorage.setItem(
-      CHAT_HISTORY_KEY,
-      JSON.stringify(updatedHistory),
-    );
-  };
-
-  // 3. Switch between different history items
+  // 2. Switch between different history items
   const handleSelectChat = (id) => {
     if (isLoading) return; // Prevent switching while waiting for AI response
     window.localStorage.setItem(SESSION_STORAGE_KEY, id);
     setSessionId(id);
-
-    const selectedChat = history.find((h) => h.id === id);
-    if (selectedChat) {
-      setMessages(selectedChat.messages || []);
-    }
-  };
-
-  // 4. Update localStorage whenever current active messages change
-  const updateHistoryWithMessages = (updatedMessages) => {
-    setMessages(updatedMessages);
-
-    setHistory((prevHistory) => {
-      const updated = prevHistory.map((chat) => {
-        if (chat.id === sessionId) {
-          // Find the first user message text to name the chat intelligently
-          const firstUserMsg = updatedMessages.find(
-            (m) => m.role === "user",
-          )?.content;
-          const updatedTitle = firstUserMsg
-            ? firstUserMsg.slice(0, 24) +
-              (firstUserMsg.length > 24 ? "..." : "")
-            : chat.title;
-
-          return {
-            ...chat,
-            title: chat.title === "New Chat" ? updatedTitle : chat.title,
-            messages: updatedMessages,
-          };
-        }
-        return chat;
-      });
-      window.localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(updated));
-      return updated;
-    });
+    setMessages([]);
+    void syncHistoryFromServer(id);
   };
 
   useEffect(() => {
@@ -124,10 +171,19 @@ export default function Chat({ initialPrompt = "", file = null, onBack }) {
       role: "user",
       content: initialPrompt,
       fileName: file ? file.name : null,
+      fileType: file ? file.type : null,
+      fileUploaded: Boolean(file),
+      fileInfo: file
+        ? {
+            originalName: file.name,
+            mimeType: file.type,
+            size: file.size,
+          }
+        : null,
     };
 
     const updatedMsgs = [...messages, userMessage];
-    updateHistoryWithMessages(updatedMsgs);
+    setMessages(updatedMsgs);
     setIsLoading(true);
 
     const sendRequest = () => {
@@ -168,7 +224,7 @@ export default function Chat({ initialPrompt = "", file = null, onBack }) {
         updateHistoryWithMessages([...updatedMsgs, aiResponse]);
       })
       .finally(() => setIsLoading(false));
-  }, [initialPrompt, file, sessionId]);
+  }, [initialPrompt, file, sessionId, messages]);
 
   // Handle subsequent manual input sends
   const handleSend = async (e) => {
@@ -181,10 +237,19 @@ export default function Chat({ initialPrompt = "", file = null, onBack }) {
       role: "user",
       content: input.trim(),
       fileName: selectedFile ? selectedFile.name : null,
+      fileType: selectedFile ? selectedFile.type : null,
+      fileUploaded: Boolean(selectedFile),
+      fileInfo: selectedFile
+        ? {
+            originalName: selectedFile.name,
+            mimeType: selectedFile.type,
+            size: selectedFile.size,
+          }
+        : null,
     };
 
     const updatedMsgs = [...messages, userMessage];
-    updateHistoryWithMessages(updatedMsgs);
+    setMessages(updatedMsgs);
     setIsLoading(true);
 
     const fileToSend = selectedFile;
@@ -252,16 +317,16 @@ export default function Chat({ initialPrompt = "", file = null, onBack }) {
   return (
     <div className="flex h-screen w-full bg-white text-slate-900 overflow-hidden">
       {/* LEFT SIDEBAR AREA */}
-      <aside className="w-64 border-r border-slate-200 bg-slate-50 flex flex-col shrink-0 h-full hidden md:flex">
+      <aside className="w-64 border-r border-slate-200 bg-slate-50 flex flex-col shrink-0 h-full  md:flex">
         <div className="p-4 border-b border-slate-200 flex flex-col gap-2">
           <button
-            onClick={onBack}
-            className="flex items-center gap-1 text-sm font-medium text-slate-600 hover:text-slate-900 transition"
-          >
-            ← Back to Home
-          </button>
-          <button
-            onClick={() => startNewChat()}
+            onClick={() => {
+              if (onNewChat) {
+                onNewChat();
+              } else {
+                onBack();
+              }
+            }}
             className="mt-2 w-full py-2 px-4 rounded-xl bg-slate-900 text-white text-sm font-medium transition hover:bg-slate-800 shadow-sm"
           >
             + New Chat
@@ -274,18 +339,42 @@ export default function Chat({ initialPrompt = "", file = null, onBack }) {
             Recent Conversations
           </div>
           {history.map((chat) => (
-            <button
+            <div
               key={chat.id}
-              onClick={() => handleSelectChat(chat.id)}
-              className={`w-full text-left px-3 py-2.5 rounded-xl text-sm transition font-medium truncate block
+              className={`group relative flex items-center justify-between rounded-xl transition-all duration-150
                 ${
                   chat.id === sessionId
                     ? "bg-slate-200/80 text-slate-900 font-semibold"
                     : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
                 }`}
             >
-              {chat.title}
-            </button>
+              <button
+                onClick={() => handleSelectChat(chat.id)}
+                className="w-full text-left px-3 py-2.5 text-sm font-medium truncate pr-10 block"
+              >
+                {chat.title}
+              </button>
+
+              {/* Trash Action Button revealed on parent item hover */}
+              <button
+                type="button"
+                onClick={(e) => handleDeleteChat(chat.id, e)}
+                className="absolute right-2 opacity-0 group-hover:opacity-100 p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-slate-200/60 transition-all duration-150"
+                title="Delete Conversation"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  className="h-4 w-4"
+                >
+                  <path d="M3 6h18" />
+                  <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+                  <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                </svg>
+              </button>
+            </div>
           ))}
         </div>
       </aside>
@@ -364,9 +453,53 @@ export default function Chat({ initialPrompt = "", file = null, onBack }) {
                   )}
 
                   {msg.content && (
-                    <p className="whitespace-pre-wrap break-words">
-                      {msg.content}
-                    </p>
+                    <div className="prose prose-slate max-w-none whitespace-pre-wrap break-words">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm, remarkMath]}
+                        rehypePlugins={[rehypeKatex]}
+                        components={{
+                          p: ({ node, children }) => (
+                            <p className="m-0">{children}</p>
+                          ),
+                          li: ({ node, children }) => (
+                            <li className="ml-4 list-disc">{children}</li>
+                          ),
+                          code: ({ node, inline, className, children }) => {
+                            const match = /language-(\w+)/.exec(
+                              className || "",
+                            );
+                            return inline ? (
+                              <code className="rounded bg-slate-100 px-1 py-0.5 text-sm text-slate-900">
+                                {children}
+                              </code>
+                            ) : (
+                              <pre className="rounded bg-slate-950 p-3 text-sm text-white overflow-x-auto">
+                                <code className={className}>{children}</code>
+                              </pre>
+                            );
+                          },
+                          table: ({ node, children }) => (
+                            <div className="overflow-x-auto">
+                              <table className="min-w-full border-collapse border border-slate-200">
+                                {children}
+                              </table>
+                            </div>
+                          ),
+                          th: ({ node, children }) => (
+                            <th className="border border-slate-200 bg-slate-100 px-3 py-2 text-left font-semibold">
+                              {children}
+                            </th>
+                          ),
+                          td: ({ node, children }) => (
+                            <td className="border border-slate-200 px-3 py-2">
+                              {children}
+                            </td>
+                          ),
+                        }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
+                    </div>
                   )}
                 </div>
               </div>

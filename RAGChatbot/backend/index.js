@@ -1,6 +1,4 @@
 import express from "express";
-import fs from "fs";
-import path from "path";
 import crypto from "crypto";
 import Groq from "groq-sdk";
 import cors from "cors";
@@ -46,31 +44,118 @@ async function uploadPDFToMongoDB(
   return uploadStream.id;
 }
 
-async function saveChatHistory(db, sessionId, messages) {
-  if (!sessionId || !Array.isArray(messages) || messages.length === 0) {
+async function saveChatHistory(db, sessionId, chatEntry) {
+  if (!sessionId || !chatEntry || typeof chatEntry !== "object") {
     return;
   }
 
-  const collection = db.collection("chat_messages");
-  const docs = messages.map((message) => ({
-    sessionId,
-    role: message.role,
-    content: message.content,
-    fileName: message.fileName || null,
-    mongoFileId: message.mongoFileId ? message.mongoFileId.toString() : null,
-    createdAt: new Date(),
-  }));
+  const collection = db.collection("chat_msg");
+  await collection.createIndex({ sessionId: 1 }, { unique: true });
 
-  await collection.insertMany(docs);
+  const now = chatEntry.createdAt || new Date();
+  const conversationItems = [
+    {
+      role: "user",
+      content: chatEntry.userContent ?? "",
+      createdAt: now,
+      fileName: chatEntry.fileName || null,
+      fileUploaded: Boolean(chatEntry.fileUploaded || chatEntry.mongoFileId),
+      mongoFileId: chatEntry.mongoFileId
+        ? chatEntry.mongoFileId.toString()
+        : null,
+      fileType: chatEntry.fileType || null,
+      fileInfo: chatEntry.fileInfo || null,
+    },
+    {
+      role: "assistant",
+      content: chatEntry.assistantContent ?? "",
+      createdAt: now,
+    },
+  ];
+
+  const existingSession = await collection.findOne({ sessionId });
+  const updatedConversation = existingSession?.conversation
+    ? [...existingSession.conversation, ...conversationItems]
+    : conversationItems;
+
+  const updatedContent = updatedConversation
+    .map((item) =>
+      item.role === "assistant"
+        ? `Assistant: ${item.content}`
+        : `User: ${item.content}`,
+    )
+    .join("\n");
+
+  await collection.updateOne(
+    { sessionId },
+    {
+      $setOnInsert: {
+        sessionId,
+        createdAt: existingSession?.createdAt || now,
+      },
+      $set: {
+        updatedAt: now,
+        content: updatedContent,
+        conversation: updatedConversation,
+      },
+    },
+    { upsert: true },
+  );
 }
 
-async function loadChatMemory(db, sessionId, limit = 3) {
+async function loadChatMemory(db, sessionId, limit = 20) {
   if (!sessionId) return [];
+  const sessionDoc = await db
+    .collection("chat_msg")
+    .findOne({ sessionId }, { projection: { conversation: 1 } });
+  if (!sessionDoc?.conversation) return [];
+  return sessionDoc.conversation.slice(-limit);
+}
+
+async function getSessionConversation(db, sessionId) {
+  if (!sessionId) return [];
+  const sessionDoc = await db
+    .collection("chat_msg")
+    .findOne({ sessionId }, { projection: { conversation: 1 } });
+  return sessionDoc?.conversation || [];
+}
+
+async function getLatestSessionFileInfo(db, sessionId) {
+  if (!sessionId) return null;
+  const sessionDoc = await db
+    .collection("chat_msg")
+    .findOne({ sessionId }, { projection: { conversation: 1 } });
+  if (!sessionDoc?.conversation) return null;
+
+  const latestFileEntry = [...sessionDoc.conversation]
+    .reverse()
+    .find((item) => item.role === "user" && item.mongoFileId);
+
+  if (!latestFileEntry) return null;
+
+  return {
+    mongoFileId: latestFileEntry.mongoFileId,
+    fileName: latestFileEntry.fileName || null,
+    fileType: latestFileEntry.fileType || null,
+    fileInfo: latestFileEntry.fileInfo || null,
+  };
+}
+
+async function getAllSessionSummaries(db) {
   return db
-    .collection("chat_messages")
-    .find({ sessionId })
-    .sort({ createdAt: -1 })
-    .limit(limit)
+    .collection("chat_msg")
+    .find(
+      {},
+      {
+        projection: {
+          sessionId: 1,
+          conversation: 1,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      },
+    )
+    .sort({ updatedAt: -1, createdAt: -1 })
     .toArray();
 }
 
@@ -81,6 +166,112 @@ function generateSessionId() {
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(cors());
+
+app.get("/api/chat/history", async (req, res) => {
+  const sessionId = req.query.sessionId?.toString?.().trim() || null;
+  if (!sessionId) {
+    return res.json([]);
+  }
+
+  try {
+    const client = await getMongoClient();
+    const db = client.db(mongoDbName);
+    const conversation = await getSessionConversation(db, sessionId);
+    return res.json(conversation);
+  } catch (error) {
+    console.error("Failed to load chat history from MongoDB:", error);
+    return res.status(500).json({ error: "Failed to load chat history" });
+  }
+});
+
+app.post("/api/chat/history", async (req, res) => {
+  const sessionId = req.body?.sessionId?.toString?.trim?.() || null;
+  const messages = Array.isArray(req.body?.messages) ? req.body.messages : null;
+
+  if (!sessionId || !messages) {
+    return res
+      .status(400)
+      .json({ error: "sessionId and messages are required" });
+  }
+
+  try {
+    const client = await getMongoClient();
+    const db = client.db(mongoDbName);
+    const conversation = messages.map((msg) => ({
+      role: msg.role,
+      content: msg.content || "",
+      fileName: msg.fileName || null,
+      fileUploaded: Boolean(msg.fileUploaded),
+      mongoFileId: msg.mongoFileId || null,
+      fileType: msg.fileType || null,
+      fileInfo: msg.fileInfo || null,
+      createdAt: msg.createdAt ? new Date(msg.createdAt) : new Date(),
+    }));
+
+    await db.collection("chat_msg").updateOne(
+      { sessionId },
+      {
+        $setOnInsert: {
+          sessionId,
+          createdAt: new Date(),
+        },
+        $set: {
+          updatedAt: new Date(),
+          conversation,
+        },
+      },
+      { upsert: true },
+    );
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Failed to save chat history via /api/chat/history:", error);
+    return res.status(500).json({ error: "Failed to save chat history" });
+  }
+});
+
+app.delete("/api/chat/history", async (req, res) => {
+  const sessionId = req.query?.sessionId?.toString?.trim?.() || null;
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId is required" });
+  }
+
+  try {
+    const client = await getMongoClient();
+    const db = client.db(mongoDbName);
+    await db.collection("chat_msg").deleteOne({ sessionId });
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Failed to delete chat history:", error);
+    return res.status(500).json({ error: "Failed to delete chat history" });
+  }
+});
+
+app.get("/api/chat/sessions", async (req, res) => {
+  try {
+    const client = await getMongoClient();
+    const db = client.db(mongoDbName);
+    const sessions = await getAllSessionSummaries(db);
+    const summaries = sessions.map((doc) => {
+      const firstUser =
+        doc.conversation?.find((item) => item.role === "user")?.content ||
+        "New Chat";
+      const title =
+        firstUser.slice(0, 24) + (firstUser.length > 24 ? "..." : "");
+      return {
+        id: doc.sessionId,
+        sessionId: doc.sessionId,
+        title,
+        updatedAt: doc.updatedAt || doc.createdAt,
+        lastMessage: doc.conversation?.slice(-1)[0]?.content || "",
+      };
+    });
+    return res.json(summaries);
+  } catch (error) {
+    console.error("Failed to load chat sessions from MongoDB:", error);
+    return res.status(500).json({ error: "Failed to load chat sessions" });
+  }
+});
 
 const conditionalUpload = (req, res, next) => {
   const contentType = req.headers["content-type"] || "";
@@ -96,6 +287,7 @@ app.post("/api/chat", conditionalUpload, async (req, res) => {
   const query = req.body?.query?.toString?.().trim() || "";
   console.log("Incoming query:", query);
   const file = req.file;
+  console.log("Incoming file:", file ? file.originalname : "No file uploaded");
 
   let sessionId =
     req.body?.sessionId?.toString?.().trim() ||
@@ -105,9 +297,23 @@ app.post("/api/chat", conditionalUpload, async (req, res) => {
     sessionId = generateSessionId();
   }
   const timestamp = new Date();
+  const userMessageContent =
+    query || (file ? `Uploaded file: ${file.originalname}` : "");
 
   let mongoUpload = null;
   let mongoFileId = null;
+  let sessionFileInfo = null;
+
+  if (sessionId) {
+    try {
+      const client = await getMongoClient();
+      const db = client.db(mongoDbName);
+      sessionFileInfo = await getLatestSessionFileInfo(db, sessionId);
+    } catch (err) {
+      console.error("Error loading last session file info:", err);
+    }
+  }
+
   if (file) {
     console.log(`Received file upload: ${file.originalname}`);
 
@@ -127,6 +333,17 @@ app.post("/api/chat", conditionalUpload, async (req, res) => {
           database: mongoDbName,
           connection: "mongodb",
         };
+        sessionFileInfo = {
+          mongoFileId: mongoFileId.toString(),
+          fileName: file.originalname,
+          fileType: file.mimetype || null,
+          fileInfo: {
+            originalName: file.originalname,
+            mimeType: file.mimetype,
+            size: file.size,
+            uploadedAt: timestamp,
+          },
+        };
         console.log(`Uploaded PDF to MongoDB with file id: ${mongoFileId}`);
       } catch (error) {
         console.error("MongoDB PDF upload failed:", error);
@@ -142,6 +359,10 @@ app.post("/api/chat", conditionalUpload, async (req, res) => {
 
   // Build RAG system prompt and retrieve top-k context chunks if a file was uploaded
   let retrievedContext = null;
+  if (!mongoFileId && sessionFileInfo?.mongoFileId) {
+    mongoFileId = sessionFileInfo.mongoFileId;
+  }
+
   if (mongoFileId) {
     try {
       const results = await prepareDocument(mongoFileId.toString(), query);
@@ -160,14 +381,15 @@ app.post("/api/chat", conditionalUpload, async (req, res) => {
     try {
       const client = await getMongoClient();
       const db = client.db(mongoDbName);
-      const memoryMessages = await loadChatMemory(db, sessionId, 4);
+      const memoryMessages = await loadChatMemory(db, sessionId, 20);
       if (memoryMessages.length > 0) {
         memoryContext = memoryMessages
-          .map(
-            (msg) =>
-              `${msg.role === "assistant" ? "Assistant" : "User"}: ${msg.content}`,
-          )
-          .reverse()
+          .map((msg) => {
+            if (!msg.role || !msg.content) return "";
+            const roleLabel = msg.role === "assistant" ? "Assistant" : "User";
+            return `${roleLabel}: ${msg.content}`;
+          })
+          .filter(Boolean)
           .join("\n");
       }
     } catch (err) {
@@ -176,10 +398,12 @@ app.post("/api/chat", conditionalUpload, async (req, res) => {
     }
   }
 
-  const finalprompt = `You are a concise RAG assistant. Use only the provided context and recent conversation memory to answer the user's question. If the context or memory does not contain the answer, reply exactly: I don't know. Do not hallucinate or invent facts. Keep the answer relevant and concise.
-
+  const hasFile = Boolean(file);
+  const finalprompt = `You are a helpful assistant. Use conversation memory to answer the user's question and remember details from prior exchanges, including the user's name and preferences. If a file was uploaded, act as a retrieval-augmented generation (RAG) assistant: use the provided document context plus conversation memory to answer accurately and do not hallucinate. If no file was uploaded, answer as a normal assistant using only conversation memory and general knowledge. If the answer is not supported by memory or the available document context, say "I don't know." Do not invent facts.\n\n
+File uploaded: ${hasFile ? "Yes" : "No"}\n
+File name: ${file ? file.originalname : "None"}\n
 Conversation memory:\n${memoryContext || "No prior conversation memory."}\n
-Context:\n${retrievedContext || "No context available."}\n
+Document context:\n${retrievedContext || (hasFile ? "No context available." : "No file was uploaded.")}\n
 User question: ${query}\n
 Answer:`;
 
@@ -194,23 +418,41 @@ Answer:`;
     messages.push({ role: "user", content: query });
   }
 
-  const chatCompletion = await getGroqChatCompletion(messages);
+  let chatCompletion = null;
+  let assistantContent = "Sorry, I couldn't get a response from the assistant.";
+
+  try {
+    chatCompletion = await getGroqChatCompletion(messages);
+    assistantContent =
+      chatCompletion.choices?.[0]?.message?.content || assistantContent;
+  } catch (completionError) {
+    console.error("Groq chat completion failed:", completionError);
+  }
+
+  const currentFileName = file ? file.originalname : null;
+  const currentFileType = file ? file.mimetype : null;
+  const currentFileInfo = file
+    ? {
+        originalName: file.originalname,
+        mimeType: file.mimetype,
+        size: file.size,
+        uploadedAt: timestamp,
+      }
+    : null;
 
   try {
     const client = await getMongoClient();
     const db = client.db(mongoDbName);
-    await saveChatHistory(db, sessionId, [
-      {
-        role: "user",
-        content: query,
-        fileName: file ? file.originalname : null,
-        mongoFileId,
-      },
-      {
-        role: "assistant",
-        content: chatCompletion.choices?.[0]?.message?.content || "",
-      },
-    ]);
+    await saveChatHistory(db, sessionId, {
+      userContent: userMessageContent,
+      assistantContent,
+      fileName: currentFileName,
+      mongoFileId,
+      fileType: currentFileType,
+      fileUploaded: Boolean(file),
+      fileInfo: currentFileInfo,
+      createdAt: timestamp,
+    });
   } catch (saveError) {
     console.error("Failed to save chat history:", saveError);
   }
@@ -219,7 +461,9 @@ Answer:`;
     savedFile: file ? file.originalname : null,
     mongoUpload,
     sessionId,
-    response: chatCompletion,
+    response: chatCompletion || {
+      choices: [{ message: { content: assistantContent } }],
+    },
   });
 });
 

@@ -10,7 +10,7 @@ dotenv.config();
 class GoogleGenAIEmbeddings {
   constructor({
     model = "gemini-embedding-2",
-    apiKey = process.env.GEMINI_API_KEY
+    apiKey = process.env.GEMINI_API_KEY,
   } = {}) {
     if (!apiKey) {
       throw new Error(
@@ -73,10 +73,7 @@ class GoogleGenAIEmbeddings {
   }
 }
 
-export async function prepareDocument(
-  fileId,
-  prompt ,
-) {
+export async function prepareDocument(fileId, prompt) {
   const client = await getMongoClient();
   let vectorStore = null;
   let splitDocs = [];
@@ -110,8 +107,7 @@ export async function prepareDocument(
 
     const embeddings = new GoogleGenAIEmbeddings({
       model: "gemini-embedding-2",
-      apiKey:
-        process.env.GEMINI_API_KEY
+      apiKey: process.env.GEMINI_API_KEY,
     });
 
     const collection = db.collection("vector_embeddings");
@@ -143,6 +139,7 @@ export async function prepareDocument(
 
     return splitDocs;
   } finally {
-    await client.close();
+    // Do not close the shared MongoClient here.
+    // getMongoClient() returns a singleton client used across the backend.
   }
 }
