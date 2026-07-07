@@ -164,11 +164,10 @@ export default function Home() {
             </div>
           ) : (
             history.map((chat) => (
-              <div>
+              <div key={chat.id} className="group relative flex items-center">
                 <button
-                  key={chat.id}
                   onClick={() => handleSelectChat(chat.id)}
-                  className="w-full text-left px-3 py-2.5 rounded-xl text-sm transition font-medium truncate block text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+                  className="w-full text-left px-3 py-2.5 pr-10 rounded-xl text-sm transition font-medium truncate block text-slate-600 hover:bg-slate-100 hover:text-slate-900"
                 >
                   {chat.title}
                 </button>

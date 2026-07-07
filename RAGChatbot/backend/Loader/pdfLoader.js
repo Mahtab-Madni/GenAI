@@ -105,6 +105,15 @@ export async function prepareDocument(fileId, prompt) {
     });
     splitDocs = await splitter.splitDocuments(documents);
 
+    // Attach file linkage metadata so session deletes can cascade vector cleanup.
+    splitDocs = splitDocs.map((doc) => ({
+      ...doc,
+      metadata: {
+        ...(doc?.metadata || {}),
+        mongoFileId: id.toString(),
+      },
+    }));
+
     const embeddings = new GoogleGenAIEmbeddings({
       model: "gemini-embedding-2",
       apiKey: process.env.GEMINI_API_KEY,
@@ -118,6 +127,9 @@ export async function prepareDocument(fileId, prompt) {
       embeddingKey: "embedding",
     });
 
+    // Re-indexing the same file should replace older vectors, not duplicate them.
+    await collection.deleteMany({ "metadata.mongoFileId": id.toString() });
+
     // Add split documents to the vector store
     await vectorStore.addDocuments(splitDocs);
 
@@ -126,9 +138,13 @@ export async function prepareDocument(fileId, prompt) {
       try {
         const topK = 3;
         const results = await vectorStore.similaritySearch(prompt, topK);
-        console.log(
-          `🔎 Retrieved ${results.length} similar documents for prompt.`,
-        );
+
+        if (!results || results.length === 0) {
+          console.warn(
+            "No results found for the similarity search. Returning all split documents.",
+          );
+          return splitDocs;
+        }
         return results;
       } catch (e) {
         console.error("Error during similarity search:", e);

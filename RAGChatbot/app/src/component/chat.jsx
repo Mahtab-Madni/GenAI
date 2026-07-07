@@ -1,5 +1,4 @@
 /* eslint-disable no-unused-vars */
-/* eslint-disable react-hooks/immutability */
 /* eslint-disable react-hooks/set-state-in-effect */
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
@@ -36,6 +35,17 @@ export default function Chat({
   const [attachedFileName, setAttachedFileName] = useState("");
   const fileInputRef = useRef(null);
 
+  // Centralized request helper used for both initial prompt and manual sends
+  const performChatRequest = async ({ formData, json }) => {
+    if (formData) {
+      return axios.post("http://localhost:3000/api/chat", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+    }
+
+    return axios.post("http://localhost:3000/api/chat", json);
+  };
+
   const syncHistoryFromServer = async (currentSessionId) => {
     if (!currentSessionId) return;
 
@@ -58,6 +68,7 @@ export default function Chat({
             role: msg.role,
             content: msg.content || "",
             fileName: msg.fileName || null,
+            fileType: msg.fileType || null,
           }));
 
         setMessages(loadedMessages);
@@ -143,6 +154,7 @@ export default function Chat({
     }
 
     void fetchSessionSummaries();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 2. Switch between different history items
@@ -160,11 +172,19 @@ export default function Chat({
 
   // Handle Initial Landing Setup
   useEffect(() => {
-    const hasContent = initialPrompt || file?.name;
+    const hasPrompt = Boolean(initialPrompt?.trim());
+    const hasContent = hasPrompt || Boolean(file?.name);
     if (!hasContent || hasSentInitialRef.current) return;
     if (!sessionId) return;
 
     hasSentInitialRef.current = true;
+
+    if (!hasPrompt) {
+      setIsLoading(false);
+      setSelectedFile(null);
+      setAttachedFileName("");
+      return;
+    }
 
     const userMessage = {
       id: Date.now().toString(),
@@ -186,22 +206,27 @@ export default function Chat({
     setMessages(updatedMsgs);
     setIsLoading(true);
 
-    const sendRequest = () => {
+    const performInitialSend = () => {
       if (file) {
         const formData = new FormData();
         formData.append("query", initialPrompt);
         formData.append("file", file);
         formData.append("sessionId", sessionId);
-        return axios.post("http://localhost:3000/api/chat", formData);
+        return performChatRequest({ formData });
       }
-      return axios.post("http://localhost:3000/api/chat", {
-        query: initialPrompt,
-        sessionId,
-      });
+      return performChatRequest({ json: { query: initialPrompt, sessionId } });
     };
 
-    sendRequest()
+    performInitialSend()
       .then((response) => {
+        // If the server marked this as an indexing-only upload, don't
+        // insert a placeholder assistant reply — just persist the user
+        // message with the file info and return.
+        if (response?.data?.indexingOnly) {
+          updateHistoryWithMessages(updatedMsgs);
+          return;
+        }
+
         const assistantContent =
           response.data.response?.choices?.[0]?.message?.content ||
           "Sorry, I couldn't get a response from the assistant.";
@@ -223,7 +248,13 @@ export default function Chat({
         };
         updateHistoryWithMessages([...updatedMsgs, aiResponse]);
       })
-      .finally(() => setIsLoading(false));
+      .finally(() => {
+        setIsLoading(false);
+        // Clear background state if it was an initial file landing drop
+        setSelectedFile(null);
+        setAttachedFileName("");
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPrompt, file, sessionId, messages]);
 
   // Handle subsequent manual input sends
@@ -252,26 +283,45 @@ export default function Chat({
     setMessages(updatedMsgs);
     setIsLoading(true);
 
-    const fileToSend = selectedFile;
     setInput("");
     setAttachedFileName("");
     setSelectedFile(null);
 
-    const sendRequest = () => {
-      if (fileToSend) {
-        const formData = new FormData();
-        formData.append("query", userMessage.content);
-        formData.append("file", fileToSend);
-        formData.append("sessionId", sessionId);
-        return axios.post("http://localhost:3000/api/chat", formData);
-      }
-      return axios.post("http://localhost:3000/api/chat", {
-        query: userMessage.content,
-        sessionId,
-      });
-    };
+    if (selectedFile) {
+      const formData = new FormData();
+      formData.append("query", userMessage.content);
+      formData.append("file", selectedFile);
+      formData.append("sessionId", sessionId);
+      performChatRequest({ formData })
+        .then((response) => {
+          const assistantContent =
+            response.data.response?.choices?.[0]?.message?.content ||
+            "Sorry, I couldn't get a response from the assistant.";
 
-    sendRequest()
+          const aiResponse = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: assistantContent,
+          };
+          updateHistoryWithMessages([...updatedMsgs, aiResponse]);
+        })
+        .catch((error) => {
+          console.error("Error calling chat API:", error);
+          const aiResponse = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content:
+              "There was an error contacting the assistant. Please try again.",
+          };
+          updateHistoryWithMessages([...updatedMsgs, aiResponse]);
+        })
+        .finally(() => setIsLoading(false));
+      return;
+    }
+
+    performChatRequest({
+      json: { query: userMessage.content, sessionId },
+    })
       .then((response) => {
         const assistantContent =
           response.data.response?.choices?.[0]?.message?.content ||
@@ -297,9 +347,11 @@ export default function Chat({
       .finally(() => setIsLoading(false));
   };
 
-  const handleFileChange = (event) => {
+  // Keep the selected file locally until the user submits a question.
+  const handleFileChange = async (event) => {
     const fileObj = event.target.files?.[0];
-    if (!fileObj) return;
+    if (!fileObj || !sessionId) return;
+
     setAttachedFileName(fileObj.name);
     setSelectedFile(fileObj);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -536,27 +588,29 @@ export default function Chat({
               {/* File Attachment Chip Layer */}
               {attachedFileName && (
                 <div className="w-full flex justify-start mb-2 px-1">
-                  <div className="group relative flex items-center gap-2 rounded-xl border border-slate-150 bg-slate-50/80 px-3 py-1.5 pr-8 text-sm text-slate-800 shadow-sm max-w-xs">
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      className="h-4 w-4 text-slate-500 shrink-0"
-                    >
-                      <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
-                      <polyline points="14 2 14 8 20 8" />
-                    </svg>
-                    <span className="truncate font-medium max-w-[180px]">
-                      {attachedFileName}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={removeFile}
-                      className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-5 w-5 items-center justify-center rounded-full bg-slate-200/70 text-slate-600 transition hover:bg-slate-300 text-xs font-bold"
-                    >
-                      ✕
-                    </button>
+                  <div className="group relative flex flex-col items-start gap-2 rounded-xl border border-slate-150 bg-slate-50/80 px-3 py-1.5 pr-8 text-sm text-slate-800 shadow-sm max-w-xs">
+                    <div className="flex items-center gap-2 w-full">
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        className="h-4 w-4 text-slate-500 shrink-0"
+                      >
+                        <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
+                        <polyline points="14 2 14 8 20 8" />
+                      </svg>
+                      <span className="truncate font-medium max-w-[140px]">
+                        {attachedFileName}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={removeFile}
+                        className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-5 w-5 items-center justify-center rounded-full bg-slate-200/70 text-slate-600 transition hover:bg-slate-300 text-xs font-bold"
+                      >
+                        ✕
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
