@@ -564,8 +564,7 @@ export default function Chat({
                   ✨
                 </div>
                 <div className="space-y-2 pt-2 w-full max-w-[60%]">
-                  <div className="h-3 w-full animate-pulse rounded bg-slate-100" />
-                  <div className="h-3 w-5/6 animate-pulse rounded bg-slate-100" />
+                  <span className="h-3 w-full animate-pulse rounded bg-transparent">Thinking...</span>
                 </div>
               </div>
             )}
