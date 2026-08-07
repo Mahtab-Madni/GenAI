@@ -1,6 +1,7 @@
 import Groq from "groq-sdk";
 import dotenv from "dotenv";
-import { tavily } from "@tavily/core"; // WebSearh Toools - Tavily API , Serper.dev (Google Search API) , Brave Search API . 
+import { tavily } from "@tavily/core"; // WebSearh Toools - Tavily API , Serper.dev (Google Search API) , Brave Search API .
+//  Powerful Tools for research purpose, multi-step web agents -> Parallel-web  (npm install parallel-web) https://docs.parallel.ai/getting-started/overview
 import readline from "node:readline/promises";
 
 const rl = readline.createInterface({
