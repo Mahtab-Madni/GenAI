@@ -133,6 +133,13 @@ export async function prepareDocument(fileId, prompt) {
     // Add split documents to the vector store
     await vectorStore.addDocuments(splitDocs);
 
+    // Small documents fit comfortably in the prompt, so keep every chunk. This
+    // avoids losing an answer when vector ranking favors a nearby but incomplete
+    // chunk.
+    if (splitDocs.length <= 10) {
+      return splitDocs;
+    }
+
     // If a prompt was provided, run a similarity search and return the top matches
     if (prompt && typeof prompt === "string" && prompt.trim().length > 0) {
       try {
